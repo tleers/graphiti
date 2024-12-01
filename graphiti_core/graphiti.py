@@ -80,6 +80,12 @@ from graphiti_core.utils.maintenance.node_operations import (
 )
 from graphiti_core.utils.maintenance.temporal_operations import get_edge_contradictions
 
+from graphiti_core.llm_client import LLMClient, OpenAIClient, AzureOpenAIClient
+from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder, AzureOpenAIEmbedder  
+from graphiti_core.cross_encoder.azure_openai_reranker_client import AzureOpenAIRerankerClient
+from graphiti_core.llm_client.config import LLMConfig, AzureLLMConfig
+
+
 logger = logging.getLogger(__name__)
 
 load_dotenv()
@@ -97,63 +103,85 @@ class Graphiti:
         uri: str,
         user: str,
         password: str,
+        config: LLMConfig | AzureLLMConfig | None = None,
         llm_client: LLMClient | None = None,
-        embedder: EmbedderClient | None = None,
+        embedder: EmbedderClient | None = None, 
         cross_encoder: CrossEncoderClient | None = None,
         store_raw_episode_content: bool = True,
     ):
-        """
-        Initialize a Graphiti instance.
-
-        This constructor sets up a connection to the Neo4j database and initializes
-        the LLM client for natural language processing tasks.
-
-        Parameters
-        ----------
-        uri : str
-            The URI of the Neo4j database.
-        user : str
-            The username for authenticating with the Neo4j database.
-        password : str
-            The password for authenticating with the Neo4j database.
-        llm_client : LLMClient | None, optional
-            An instance of LLMClient for natural language processing tasks.
-            If not provided, a default OpenAIClient will be initialized.
-
-        Returns
-        -------
-        None
-
-        Notes
-        -----
-        This method establishes a connection to the Neo4j database using the provided
-        credentials. It also sets up the LLM client, either using the provided client
-        or by creating a default OpenAIClient.
-
-        The default database name is set to 'neo4j'. If a different database name
-        is required, it should be specified in the URI or set separately after
-        initialization.
-
-        The OpenAI API key is expected to be set in the environment variables.
-        Make sure to set the OPENAI_API_KEY environment variable before initializing
-        Graphiti if you're using the default OpenAIClient.
+        """Initialize Graphiti with either OpenAI or Azure OpenAI support.
+        
+        Args:
+            uri: Neo4j database URI
+            user: Database username  
+            password: Database password
+            config: LLMConfig or AzureLLMConfig for client initialization
+            llm_client: Optional pre-configured LLM client
+            embedder: Optional pre-configured embedder
+            cross_encoder: Optional pre-configured cross encoder
+            store_raw_episode_content: Whether to store raw episode content
         """
         self.driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
         self.database = DEFAULT_DATABASE
         self.store_raw_episode_content = store_raw_episode_content
-        if llm_client:
-            self.llm_client = llm_client
-        else:
-            self.llm_client = OpenAIClient()
-        if embedder:
-            self.embedder = embedder
-        else:
-            self.embedder = OpenAIEmbedder()
-        if cross_encoder:
-            self.cross_encoder = cross_encoder
-        else:
-            self.cross_encoder = OpenAIRerankerClient()
 
+        # Initialize clients based on config type
+        if config is None:
+            config = LLMConfig()
+            
+    def __init__(
+        self,
+        uri: str,
+        user: str,
+        password: str,
+        config: LLMConfig | AzureLLMConfig | None = None,
+        llm_client: LLMClient | None = None,
+        embedder: EmbedderClient | None = None, 
+        cross_encoder: CrossEncoderClient | None = None,
+        store_raw_episode_content: bool = True,
+    ):
+        self.driver = AsyncGraphDatabase.driver(uri, auth=(user, password))
+        self.database = DEFAULT_DATABASE
+        self.store_raw_episode_content = store_raw_episode_content
+
+        if config is None:
+            config = LLMConfig()
+            
+        if isinstance(config, AzureLLMConfig):
+            self.llm_client = llm_client or AzureOpenAIClient(config=config)
+            self.embedder = embedder or AzureOpenAIEmbedder(config=config)
+            self.cross_encoder = cross_encoder or AzureOpenAIRerankerClient(config=config)
+        else:
+            self.llm_client = llm_client or OpenAIClient(config=config)
+            self.embedder = embedder or OpenAIEmbedder(config=config)
+            self.cross_encoder = cross_encoder or OpenAIRerankerClient(config=config)
+
+    @classmethod
+    def create_azure_instance(
+        cls,
+        uri: str,
+        user: str, 
+        password: str,
+        azure_config: AzureLLMConfig,
+        store_raw_episode_content: bool = True,
+    ) -> "Graphiti":
+        """Create Graphiti instance with Azure OpenAI clients"""
+        
+        # Initialize Azure clients
+        azure_llm = AzureOpenAIClient(config=azure_config)
+        azure_embedder = AzureOpenAIEmbedder(config=azure_config)
+        azure_reranker = AzureOpenAIRerankerClient(config=azure_config)
+
+        return cls(
+            uri=uri,
+            user=user,
+            password=password,
+            llm_client=azure_llm,
+            embedder=azure_embedder,
+            cross_encoder=azure_reranker,
+            store_raw_episode_content=store_raw_episode_content
+        )
+    
     async def close(self):
         """
         Close the connection to the Neo4j database.
