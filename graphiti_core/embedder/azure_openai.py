@@ -14,6 +14,8 @@ class AzureOpenAIEmbedderConfig(EmbedderConfig):
     base_url: str | None = None
     api_version: str | None = None
     azure_deployment: str | None = None
+    max_retries: int = 5
+    timeout: int = 200
 
 class AzureOpenAIEmbedder(EmbedderClient):
     """Azure OpenAI Embedder Client"""
@@ -30,7 +32,9 @@ class AzureOpenAIEmbedder(EmbedderClient):
             api_key=config.api_key,
             azure_endpoint=config.base_url,
             api_version=config.api_version,
-            azure_deployment=config.azure_deployment or config.embedding_model
+            azure_deployment=config.azure_deployment or config.embedding_model,
+            max_retries=config.max_retries,
+            timeout=config.timeout
         )
 
     async def create(
