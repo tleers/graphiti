@@ -2,8 +2,8 @@
 import typing
 from openai import AsyncAzureOpenAI
 
-from .openai_client import OpenAIClient, DEFAULT_MODEL
-from .config import AzureLLMConfig, LLMConfig
+from .openai_client import OpenAIClient
+from .config import AzureLLMConfig
 from ..prompts.models import Message
 
 class AzureOpenAIClient(OpenAIClient):
