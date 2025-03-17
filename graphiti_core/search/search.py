@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio
 import logging
 from collections import defaultdict
 from time import time
@@ -25,6 +24,7 @@ from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.edges import EntityEdge
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import SearchRerankerError
+from graphiti_core.helpers import semaphore_gather
 from graphiti_core.nodes import CommunityNode, EntityNode
 from graphiti_core.search.search_config import (
     DEFAULT_SEARCH_LIMIT,
@@ -32,11 +32,14 @@ from graphiti_core.search.search_config import (
     CommunitySearchConfig,
     EdgeReranker,
     EdgeSearchConfig,
+    EdgeSearchMethod,
     NodeReranker,
     NodeSearchConfig,
+    NodeSearchMethod,
     SearchConfig,
     SearchResults,
 )
+from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import (
     community_fulltext_search,
     community_similarity_search,
@@ -62,6 +65,7 @@ async def search(
     query: str,
     group_ids: list[str] | None,
     config: SearchConfig,
+    search_filter: SearchFilters,
     center_node_uuid: str | None = None,
     bfs_origin_node_uuids: list[str] | None = None,
 ) -> SearchResults:
@@ -76,7 +80,7 @@ async def search(
 
     # if group_ids is empty, set it to None
     group_ids = group_ids if group_ids else None
-    edges, nodes, communities = await asyncio.gather(
+    edges, nodes, communities = await semaphore_gather(
         edge_search(
             driver,
             cross_encoder,
@@ -84,6 +88,7 @@ async def search(
             query_vector,
             group_ids,
             config.edge_config,
+            search_filter,
             center_node_uuid,
             bfs_origin_node_uuids,
             config.limit,
@@ -95,6 +100,7 @@ async def search(
             query_vector,
             group_ids,
             config.node_config,
+            search_filter,
             center_node_uuid,
             bfs_origin_node_uuids,
             config.limit,
@@ -131,6 +137,7 @@ async def edge_search(
     query_vector: list[float],
     group_ids: list[str] | None,
     config: EdgeSearchConfig | None,
+    search_filter: SearchFilters,
     center_node_uuid: str | None = None,
     bfs_origin_node_uuids: list[str] | None = None,
     limit=DEFAULT_SEARCH_LIMIT,
@@ -139,16 +146,33 @@ async def edge_search(
         return []
 
     search_results: list[list[EntityEdge]] = list(
-        await asyncio.gather(
+        await semaphore_gather(
             *[
-                edge_fulltext_search(driver, query, None, None, group_ids, 2 * limit),
+                edge_fulltext_search(driver, query, search_filter, group_ids, 2 * limit),
                 edge_similarity_search(
-                    driver, query_vector, None, None, group_ids, 2 * limit, config.sim_min_score
+                    driver,
+                    query_vector,
+                    None,
+                    None,
+                    search_filter,
+                    group_ids,
+                    2 * limit,
+                    config.sim_min_score,
                 ),
-                edge_bfs_search(driver, bfs_origin_node_uuids, config.bfs_max_depth, 2 * limit),
+                edge_bfs_search(
+                    driver, bfs_origin_node_uuids, config.bfs_max_depth, search_filter, 2 * limit
+                ),
             ]
         )
     )
+
+    if EdgeSearchMethod.bfs in config.search_methods and bfs_origin_node_uuids is None:
+        source_node_uuids = [edge.source_node_uuid for result in search_results for edge in result]
+        search_results.append(
+            await edge_bfs_search(
+                driver, source_node_uuids, config.bfs_max_depth, search_filter, 2 * limit
+            )
+        )
 
     edge_uuid_map = {edge.uuid: edge for result in search_results for edge in result}
 
@@ -210,6 +234,7 @@ async def node_search(
     query_vector: list[float],
     group_ids: list[str] | None,
     config: NodeSearchConfig | None,
+    search_filter: SearchFilters,
     center_node_uuid: str | None = None,
     bfs_origin_node_uuids: list[str] | None = None,
     limit=DEFAULT_SEARCH_LIMIT,
@@ -218,16 +243,26 @@ async def node_search(
         return []
 
     search_results: list[list[EntityNode]] = list(
-        await asyncio.gather(
+        await semaphore_gather(
             *[
-                node_fulltext_search(driver, query, group_ids, 2 * limit),
+                node_fulltext_search(driver, query, search_filter, group_ids, 2 * limit),
                 node_similarity_search(
-                    driver, query_vector, group_ids, 2 * limit, config.sim_min_score
+                    driver, query_vector, search_filter, group_ids, 2 * limit, config.sim_min_score
                 ),
-                node_bfs_search(driver, bfs_origin_node_uuids, config.bfs_max_depth, 2 * limit),
+                node_bfs_search(
+                    driver, bfs_origin_node_uuids, search_filter, config.bfs_max_depth, 2 * limit
+                ),
             ]
         )
     )
+
+    if NodeSearchMethod.bfs in config.search_methods and bfs_origin_node_uuids is None:
+        origin_node_uuids = [node.uuid for result in search_results for node in result]
+        search_results.append(
+            await node_bfs_search(
+                driver, origin_node_uuids, search_filter, config.bfs_max_depth, 2 * limit
+            )
+        )
 
     search_result_uuids = [[node.uuid for node in result] for result in search_results]
     node_uuid_map = {node.uuid: node for result in search_results for node in result}
@@ -281,7 +316,7 @@ async def community_search(
         return []
 
     search_results: list[list[CommunityNode]] = list(
-        await asyncio.gather(
+        await semaphore_gather(
             *[
                 community_fulltext_search(driver, query, group_ids, 2 * limit),
                 community_similarity_search(

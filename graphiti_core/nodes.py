@@ -16,7 +16,7 @@ limitations under the License.
 
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime
 from enum import Enum
 from time import time
 from typing import Any
@@ -24,6 +24,7 @@ from uuid import uuid4
 
 from neo4j import AsyncDriver
 from pydantic import BaseModel, Field
+from typing_extensions import LiteralString
 
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import NodeNotFoundError
@@ -33,6 +34,7 @@ from graphiti_core.models.nodes.node_db_queries import (
     ENTITY_NODE_SAVE,
     EPISODIC_NODE_SAVE,
 )
+from graphiti_core.utils.datetime_utils import utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +80,7 @@ class Node(BaseModel, ABC):
     name: str = Field(description='name of the node')
     group_id: str = Field(description='partition of the graph')
     labels: list[str] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: utc_now())
 
     @abstractmethod
     async def save(self, driver: AsyncDriver): ...
@@ -86,7 +88,7 @@ class Node(BaseModel, ABC):
     async def delete(self, driver: AsyncDriver):
         result = await driver.execute_query(
             """
-        MATCH (n {uuid: $uuid})
+        MATCH (n:Entity|Episodic|Community {uuid: $uuid})
         DETACH DELETE n
         """,
             uuid=self.uuid,
@@ -104,6 +106,19 @@ class Node(BaseModel, ABC):
         if isinstance(other, Node):
             return self.uuid == other.uuid
         return False
+
+    @classmethod
+    async def delete_by_group_id(cls, driver: AsyncDriver, group_id: str):
+        await driver.execute_query(
+            """
+        MATCH (n:Entity|Episodic|Community {group_id: $group_id})
+        DETACH DELETE n
+        """,
+            group_id=group_id,
+            database_=DEFAULT_DATABASE,
+        )
+
+        return 'SUCCESS'
 
     @classmethod
     async def get_by_uuid(cls, driver: AsyncDriver, uuid: str): ...
@@ -155,10 +170,12 @@ class EpisodicNode(Node):
             e.name AS name,
             e.group_id AS group_id,
             e.source_description AS source_description,
-            e.source AS source
+            e.source AS source,
+            e.entity_edges AS entity_edges
         """,
             uuid=uuid,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         episodes = [get_episodic_node_from_record(record) for record in records]
@@ -181,10 +198,12 @@ class EpisodicNode(Node):
             e.name AS name,
             e.group_id AS group_id,
             e.source_description AS source_description,
-            e.source AS source
+            e.source AS source,
+            e.entity_edges AS entity_edges
         """,
             uuids=uuids,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         episodes = [get_episodic_node_from_record(record) for record in records]
@@ -192,10 +211,22 @@ class EpisodicNode(Node):
         return episodes
 
     @classmethod
-    async def get_by_group_ids(cls, driver: AsyncDriver, group_ids: list[str]):
+    async def get_by_group_ids(
+        cls,
+        driver: AsyncDriver,
+        group_ids: list[str],
+        limit: int | None = None,
+        created_at: datetime | None = None,
+    ):
+        cursor_query: LiteralString = 'AND e.created_at < $created_at' if created_at else ''
+        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+
         records, _, _ = await driver.execute_query(
             """
         MATCH (e:Episodic) WHERE e.group_id IN $group_ids
+        """
+            + cursor_query
+            + """
             RETURN DISTINCT
             e.content AS content,
             e.created_at AS created_at,
@@ -204,10 +235,16 @@ class EpisodicNode(Node):
             e.name AS name,
             e.group_id AS group_id,
             e.source_description AS source_description,
-            e.source AS source
-        """,
+            e.source AS source,
+            e.entity_edges AS entity_edges
+        ORDER BY e.uuid DESC
+        """
+            + limit_query,
             group_ids=group_ids,
+            created_at=created_at,
+            limit=limit,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         episodes = [get_episodic_node_from_record(record) for record in records]
@@ -218,6 +255,9 @@ class EpisodicNode(Node):
 class EntityNode(Node):
     name_embedding: list[float] | None = Field(default=None, description='embedding of the name')
     summary: str = Field(description='regional summary of surrounding edges', default_factory=str)
+    attributes: dict[str, Any] = Field(
+        default={}, description='Additional attributes of the node. Dependent on node labels'
+    )
 
     async def generate_name_embedding(self, embedder: EmbedderClient):
         start = time()
@@ -229,14 +269,21 @@ class EntityNode(Node):
         return self.name_embedding
 
     async def save(self, driver: AsyncDriver):
+        entity_data: dict[str, Any] = {
+            'uuid': self.uuid,
+            'name': self.name,
+            'name_embedding': self.name_embedding,
+            'group_id': self.group_id,
+            'summary': self.summary,
+            'created_at': self.created_at,
+        }
+
+        entity_data.update(self.attributes or {})
+
         result = await driver.execute_query(
             ENTITY_NODE_SAVE,
-            uuid=self.uuid,
-            name=self.name,
-            group_id=self.group_id,
-            summary=self.summary,
-            name_embedding=self.name_embedding,
-            created_at=self.created_at,
+            labels=self.labels + ['Entity'],
+            entity_data=entity_data,
             database_=DEFAULT_DATABASE,
         )
 
@@ -255,10 +302,13 @@ class EntityNode(Node):
             n.name_embedding AS name_embedding,
             n.group_id AS group_id,
             n.created_at AS created_at, 
-            n.summary AS summary
+            n.summary AS summary,
+            labels(n) AS labels,
+            properties(n) AS attributes
         """,
             uuid=uuid,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         nodes = [get_entity_node_from_record(record) for record in records]
@@ -279,10 +329,13 @@ class EntityNode(Node):
             n.name_embedding AS name_embedding,
             n.group_id AS group_id,
             n.created_at AS created_at, 
-            n.summary AS summary
+            n.summary AS summary,
+            labels(n) AS labels,
+            properties(n) AS attributes
         """,
             uuids=uuids,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         nodes = [get_entity_node_from_record(record) for record in records]
@@ -290,20 +343,39 @@ class EntityNode(Node):
         return nodes
 
     @classmethod
-    async def get_by_group_ids(cls, driver: AsyncDriver, group_ids: list[str]):
+    async def get_by_group_ids(
+        cls,
+        driver: AsyncDriver,
+        group_ids: list[str],
+        limit: int | None = None,
+        created_at: datetime | None = None,
+    ):
+        cursor_query: LiteralString = 'AND n.created_at < $created_at' if created_at else ''
+        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+
         records, _, _ = await driver.execute_query(
             """
         MATCH (n:Entity) WHERE n.group_id IN $group_ids
+        """
+            + cursor_query
+            + """
         RETURN
             n.uuid As uuid, 
             n.name AS name,
             n.name_embedding AS name_embedding,
             n.group_id AS group_id,
             n.created_at AS created_at, 
-            n.summary AS summary
-        """,
+            n.summary AS summary,
+            labels(n) AS labels,
+            properties(n) AS attributes
+        ORDER BY n.uuid DESC
+        """
+            + limit_query,
             group_ids=group_ids,
+            created_at=created_at,
+            limit=limit,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         nodes = [get_entity_node_from_record(record) for record in records]
@@ -355,6 +427,7 @@ class CommunityNode(Node):
         """,
             uuid=uuid,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         nodes = [get_community_node_from_record(record) for record in records]
@@ -379,6 +452,7 @@ class CommunityNode(Node):
         """,
             uuids=uuids,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         communities = [get_community_node_from_record(record) for record in records]
@@ -386,10 +460,22 @@ class CommunityNode(Node):
         return communities
 
     @classmethod
-    async def get_by_group_ids(cls, driver: AsyncDriver, group_ids: list[str]):
+    async def get_by_group_ids(
+        cls,
+        driver: AsyncDriver,
+        group_ids: list[str],
+        limit: int | None = None,
+        created_at: datetime | None = None,
+    ):
+        cursor_query: LiteralString = 'AND n.created_at < $created_at' if created_at else ''
+        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+
         records, _, _ = await driver.execute_query(
             """
         MATCH (n:Community) WHERE n.group_id IN $group_ids
+        """
+            + cursor_query
+            + """
         RETURN
             n.uuid As uuid, 
             n.name AS name,
@@ -397,9 +483,14 @@ class CommunityNode(Node):
             n.group_id AS group_id,
             n.created_at AS created_at, 
             n.summary AS summary
-        """,
+        ORDER BY n.uuid DESC
+        """
+            + limit_query,
             group_ids=group_ids,
+            created_at=created_at,
+            limit=limit,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         communities = [get_community_node_from_record(record) for record in records]
@@ -418,19 +509,30 @@ def get_episodic_node_from_record(record: Any) -> EpisodicNode:
         source=EpisodeType.from_str(record['source']),
         name=record['name'],
         source_description=record['source_description'],
+        entity_edges=record['entity_edges'],
     )
 
 
 def get_entity_node_from_record(record: Any) -> EntityNode:
-    return EntityNode(
+    entity_node = EntityNode(
         uuid=record['uuid'],
         name=record['name'],
         group_id=record['group_id'],
         name_embedding=record['name_embedding'],
-        labels=['Entity'],
+        labels=record['labels'],
         created_at=record['created_at'].to_native(),
         summary=record['summary'],
+        attributes=record['attributes'],
     )
+
+    del entity_node.attributes['uuid']
+    del entity_node.attributes['name']
+    del entity_node.attributes['group_id']
+    del entity_node.attributes['name_embedding']
+    del entity_node.attributes['summary']
+    del entity_node.attributes['created_at']
+
+    return entity_node
 
 
 def get_community_node_from_record(record: Any) -> CommunityNode:

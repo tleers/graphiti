@@ -14,16 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from time import time
-from typing import List
 
 from graphiti_core.edges import CommunityEdge, EntityEdge, EpisodicEdge
+from graphiti_core.helpers import MAX_REFLEXION_ITERATIONS, semaphore_gather
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodicNode
 from graphiti_core.prompts import prompt_library
+from graphiti_core.prompts.dedupe_edges import EdgeDuplicate, UniqueFacts
+from graphiti_core.prompts.extract_edges import ExtractedEdges, MissingFacts
+from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.temporal_operations import (
     extract_edge_dates,
     get_edge_contradictions,
@@ -33,11 +35,11 @@ logger = logging.getLogger(__name__)
 
 
 def build_episodic_edges(
-    entity_nodes: List[EntityNode],
+    entity_nodes: list[EntityNode],
     episode: EpisodicNode,
     created_at: datetime,
-) -> List[EpisodicEdge]:
-    edges: List[EpisodicEdge] = [
+) -> list[EpisodicEdge]:
+    edges: list[EpisodicEdge] = [
         EpisodicEdge(
             source_node_uuid=episode.uuid,
             target_node_uuid=node.uuid,
@@ -51,11 +53,11 @@ def build_episodic_edges(
 
 
 def build_community_edges(
-    entity_nodes: List[EntityNode],
+    entity_nodes: list[EntityNode],
     community_node: CommunityNode,
     created_at: datetime,
-) -> List[CommunityEdge]:
-    edges: List[CommunityEdge] = [
+) -> list[CommunityEdge]:
+    edges: list[CommunityEdge] = [
         CommunityEdge(
             source_node_uuid=community_node.uuid,
             target_node_uuid=node.uuid,
@@ -77,24 +79,45 @@ async def extract_edges(
 ) -> list[EntityEdge]:
     start = time()
 
+    EXTRACT_EDGES_MAX_TOKENS = 16384
+
+    node_uuids_by_name_map = {node.name: node.uuid for node in nodes}
+
     # Prepare context for LLM
     context = {
         'episode_content': episode.content,
-        'episode_timestamp': (episode.valid_at.isoformat() if episode.valid_at else None),
-        'nodes': [
-            {'uuid': node.uuid, 'name': node.name, 'summary': node.summary} for node in nodes
-        ],
-        'previous_episodes': [
-            {
-                'content': ep.content,
-                'timestamp': ep.valid_at.isoformat() if ep.valid_at else None,
-            }
-            for ep in previous_episodes
-        ],
+        'nodes': [node.name for node in nodes],
+        'previous_episodes': [ep.content for ep in previous_episodes],
+        'custom_prompt': '',
     }
 
-    llm_response = await llm_client.generate_response(prompt_library.extract_edges.v2(context))
-    edges_data = llm_response.get('edges', [])
+    facts_missed = True
+    reflexion_iterations = 0
+    while facts_missed and reflexion_iterations < MAX_REFLEXION_ITERATIONS:
+        llm_response = await llm_client.generate_response(
+            prompt_library.extract_edges.edge(context),
+            response_model=ExtractedEdges,
+            max_tokens=EXTRACT_EDGES_MAX_TOKENS,
+        )
+        edges_data = llm_response.get('edges', [])
+
+        context['extracted_facts'] = [edge_data.get('fact', '') for edge_data in edges_data]
+
+        reflexion_iterations += 1
+        if reflexion_iterations < MAX_REFLEXION_ITERATIONS:
+            reflexion_response = await llm_client.generate_response(
+                prompt_library.extract_edges.reflexion(context), response_model=MissingFacts
+            )
+
+            missing_facts = reflexion_response.get('missing_facts', [])
+
+            custom_prompt = 'The following facts were missed in a previous extraction: '
+            for fact in missing_facts:
+                custom_prompt += f'\n{fact},'
+
+            context['custom_prompt'] = custom_prompt
+
+            facts_missed = len(missing_facts) != 0
 
     end = time()
     logger.debug(f'Extracted new edges: {edges_data} in {(end - start) * 1000} ms')
@@ -102,22 +125,25 @@ async def extract_edges(
     # Convert the extracted data into EntityEdge objects
     edges = []
     for edge_data in edges_data:
-        if edge_data['target_node_uuid'] and edge_data['source_node_uuid']:
-            edge = EntityEdge(
-                source_node_uuid=edge_data['source_node_uuid'],
-                target_node_uuid=edge_data['target_node_uuid'],
-                name=edge_data['relation_type'],
-                group_id=group_id,
-                fact=edge_data['fact'],
-                episodes=[episode.uuid],
-                created_at=datetime.now(timezone.utc),
-                valid_at=None,
-                invalid_at=None,
-            )
-            edges.append(edge)
-            logger.debug(
-                f'Created new edge: {edge.name} from (UUID: {edge.source_node_uuid}) to (UUID: {edge.target_node_uuid})'
-            )
+        edge = EntityEdge(
+            source_node_uuid=node_uuids_by_name_map.get(
+                edge_data.get('source_entity_name', ''), ''
+            ),
+            target_node_uuid=node_uuids_by_name_map.get(
+                edge_data.get('target_entity_name', ''), ''
+            ),
+            name=edge_data.get('relation_type', ''),
+            group_id=group_id,
+            fact=edge_data.get('fact', ''),
+            episodes=[episode.uuid],
+            created_at=utc_now(),
+            valid_at=None,
+            invalid_at=None,
+        )
+        edges.append(edge)
+        logger.debug(
+            f'Created new edge: {edge.name} from (UUID: {edge.source_node_uuid}) to (UUID: {edge.target_node_uuid})'
+        )
 
     return edges
 
@@ -142,7 +168,7 @@ async def dedupe_extracted_edges(
         ],
     }
 
-    llm_response = await llm_client.generate_response(prompt_library.dedupe_edges.v1(context))
+    llm_response = await llm_client.generate_response(prompt_library.dedupe_edges.edge(context))
     duplicate_data = llm_response.get('duplicates', [])
     logger.debug(f'Extracted unique edges: {duplicate_data}')
 
@@ -176,7 +202,7 @@ async def resolve_extracted_edges(
 ) -> tuple[list[EntityEdge], list[EntityEdge]]:
     # resolve edges with related edges in the graph, extract temporal information, and find invalidation candidates
     results: list[tuple[EntityEdge, list[EntityEdge]]] = list(
-        await asyncio.gather(
+        await semaphore_gather(
             *[
                 resolve_extracted_edge(
                     llm_client,
@@ -229,9 +255,7 @@ def resolve_edge_contradictions(
             and edge.valid_at < resolved_edge.valid_at
         ):
             edge.invalid_at = resolved_edge.valid_at
-            edge.expired_at = (
-                edge.expired_at if edge.expired_at is not None else datetime.now(timezone.utc)
-            )
+            edge.expired_at = edge.expired_at if edge.expired_at is not None else utc_now()
             invalidated_edges.append(edge)
 
     return invalidated_edges
@@ -245,17 +269,18 @@ async def resolve_extracted_edge(
     current_episode: EpisodicNode,
     previous_episodes: list[EpisodicNode],
 ) -> tuple[EntityEdge, list[EntityEdge]]:
-    resolved_edge, (valid_at, invalid_at), invalidation_candidates = await asyncio.gather(
+    resolved_edge, (valid_at, invalid_at), invalidation_candidates = await semaphore_gather(
         dedupe_extracted_edge(llm_client, extracted_edge, related_edges),
         extract_edge_dates(llm_client, extracted_edge, current_episode, previous_episodes),
         get_edge_contradictions(llm_client, extracted_edge, existing_edges),
     )
 
-    now = datetime.now(timezone.utc)
+    now = utc_now()
 
-    resolved_edge.valid_at = valid_at if valid_at is not None else resolved_edge.valid_at
-    resolved_edge.invalid_at = invalid_at if invalid_at is not None else resolved_edge.invalid_at
-    if invalid_at is not None and resolved_edge.expired_at is None:
+    resolved_edge.valid_at = valid_at if valid_at else resolved_edge.valid_at
+    resolved_edge.invalid_at = invalid_at if invalid_at else resolved_edge.invalid_at
+
+    if invalid_at and not resolved_edge.expired_at:
         resolved_edge.expired_at = now
 
     # Determine if the new_edge needs to be expired
@@ -263,8 +288,12 @@ async def resolve_extracted_edge(
         invalidation_candidates.sort(key=lambda c: (c.valid_at is None, c.valid_at))
         for candidate in invalidation_candidates:
             if (
-                candidate.valid_at is not None and resolved_edge.valid_at is not None
-            ) and candidate.valid_at > resolved_edge.valid_at:
+                candidate.valid_at
+                and resolved_edge.valid_at
+                and candidate.valid_at.tzinfo
+                and resolved_edge.valid_at.tzinfo
+                and candidate.valid_at > resolved_edge.valid_at
+            ):
                 # Expire new edge since we have information about more recent events
                 resolved_edge.invalid_at = candidate.valid_at
                 resolved_edge.expired_at = now
@@ -297,7 +326,9 @@ async def dedupe_extracted_edge(
         'extracted_edges': extracted_edge_context,
     }
 
-    llm_response = await llm_client.generate_response(prompt_library.dedupe_edges.v3(context))
+    llm_response = await llm_client.generate_response(
+        prompt_library.dedupe_edges.edge(context), response_model=EdgeDuplicate
+    )
 
     is_duplicate: bool = llm_response.get('is_duplicate', False)
     uuid: str | None = llm_response.get('uuid', None)
@@ -332,7 +363,7 @@ async def dedupe_edge_list(
     context = {'edges': [{'uuid': edge.uuid, 'fact': edge.fact} for edge in edges]}
 
     llm_response = await llm_client.generate_response(
-        prompt_library.dedupe_edges.edge_list(context)
+        prompt_library.dedupe_edges.edge_list(context), response_model=UniqueFacts
     )
     unique_edges_data = llm_response.get('unique_facts', [])
 

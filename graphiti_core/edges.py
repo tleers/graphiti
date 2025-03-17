@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from neo4j import AsyncDriver
 from pydantic import BaseModel, Field
+from typing_extensions import LiteralString
 
 from graphiti_core.embedder import EmbedderClient
 from graphiti_core.errors import EdgeNotFoundError, GroupsEdgesNotFoundError
@@ -50,7 +51,7 @@ class Edge(BaseModel, ABC):
     async def delete(self, driver: AsyncDriver):
         result = await driver.execute_query(
             """
-        MATCH (n)-[e {uuid: $uuid}]->(m)
+        MATCH (n)-[e:MENTIONS|RELATES_TO|HAS_MEMBER {uuid: $uuid}]->(m)
         DELETE e
         """,
             uuid=self.uuid,
@@ -103,6 +104,7 @@ class EpisodicEdge(Edge):
         """,
             uuid=uuid,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_episodic_edge_from_record(record) for record in records]
@@ -126,6 +128,7 @@ class EpisodicEdge(Edge):
         """,
             uuids=uuids,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_episodic_edge_from_record(record) for record in records]
@@ -135,20 +138,37 @@ class EpisodicEdge(Edge):
         return edges
 
     @classmethod
-    async def get_by_group_ids(cls, driver: AsyncDriver, group_ids: list[str]):
+    async def get_by_group_ids(
+        cls,
+        driver: AsyncDriver,
+        group_ids: list[str],
+        limit: int | None = None,
+        created_at: datetime | None = None,
+    ):
+        cursor_query: LiteralString = 'AND e.created_at < $created_at' if created_at else ''
+        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+
         records, _, _ = await driver.execute_query(
             """
         MATCH (n:Episodic)-[e:MENTIONS]->(m:Entity)
         WHERE e.group_id IN $group_ids
+        """
+            + cursor_query
+            + """
         RETURN
             e.uuid As uuid,
             e.group_id AS group_id,
             n.uuid AS source_node_uuid, 
             m.uuid AS target_node_uuid, 
             e.created_at AS created_at
-        """,
+        ORDER BY e.uuid DESC 
+        """
+            + limit_query,
             group_ids=group_ids,
+            created_at=created_at,
+            limit=limit,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_episodic_edge_from_record(record) for record in records]
@@ -230,6 +250,7 @@ class EntityEdge(Edge):
         """,
             uuid=uuid,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_entity_edge_from_record(record) for record in records]
@@ -260,6 +281,7 @@ class EntityEdge(Edge):
         """,
             uuids=uuids,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_entity_edge_from_record(record) for record in records]
@@ -269,11 +291,23 @@ class EntityEdge(Edge):
         return edges
 
     @classmethod
-    async def get_by_group_ids(cls, driver: AsyncDriver, group_ids: list[str]):
+    async def get_by_group_ids(
+        cls,
+        driver: AsyncDriver,
+        group_ids: list[str],
+        limit: int | None = None,
+        created_at: datetime | None = None,
+    ):
+        cursor_query: LiteralString = 'AND e.created_at < $created_at' if created_at else ''
+        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+
         records, _, _ = await driver.execute_query(
             """
         MATCH (n:Entity)-[e:RELATES_TO]->(m:Entity)
         WHERE e.group_id IN $group_ids
+        """
+            + cursor_query
+            + """
         RETURN
             e.uuid AS uuid,
             n.uuid AS source_node_uuid,
@@ -287,15 +321,46 @@ class EntityEdge(Edge):
             e.expired_at AS expired_at,
             e.valid_at AS valid_at,
             e.invalid_at AS invalid_at
-        """,
+        ORDER BY e.uuid DESC 
+        """
+            + limit_query,
             group_ids=group_ids,
+            created_at=created_at,
+            limit=limit,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_entity_edge_from_record(record) for record in records]
 
         if len(edges) == 0:
             raise GroupsEdgesNotFoundError(group_ids)
+        return edges
+
+    @classmethod
+    async def get_by_node_uuid(cls, driver: AsyncDriver, node_uuid: str):
+        query: LiteralString = """
+        MATCH (n:Entity {uuid: $node_uuid})-[e:RELATES_TO]-(m:Entity)
+        RETURN DISTINCT
+            e.uuid AS uuid,
+            n.uuid AS source_node_uuid,
+            m.uuid AS target_node_uuid,
+            e.created_at AS created_at,
+            e.name AS name,
+            e.group_id AS group_id,
+            e.fact AS fact,
+            e.fact_embedding AS fact_embedding,
+            e.episodes AS episodes,
+            e.expired_at AS expired_at,
+            e.valid_at AS valid_at,
+            e.invalid_at AS invalid_at
+        """
+        records, _, _ = await driver.execute_query(
+            query, node_uuid=node_uuid, database_=DEFAULT_DATABASE, routing_='r'
+        )
+
+        edges = [get_entity_edge_from_record(record) for record in records]
+
         return edges
 
 
@@ -329,6 +394,7 @@ class CommunityEdge(Edge):
         """,
             uuid=uuid,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_community_edge_from_record(record) for record in records]
@@ -350,6 +416,7 @@ class CommunityEdge(Edge):
         """,
             uuids=uuids,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_community_edge_from_record(record) for record in records]
@@ -357,20 +424,37 @@ class CommunityEdge(Edge):
         return edges
 
     @classmethod
-    async def get_by_group_ids(cls, driver: AsyncDriver, group_ids: list[str]):
+    async def get_by_group_ids(
+        cls,
+        driver: AsyncDriver,
+        group_ids: list[str],
+        limit: int | None = None,
+        created_at: datetime | None = None,
+    ):
+        cursor_query: LiteralString = 'AND e.created_at < $created_at' if created_at else ''
+        limit_query: LiteralString = 'LIMIT $limit' if limit is not None else ''
+
         records, _, _ = await driver.execute_query(
             """
         MATCH (n:Community)-[e:HAS_MEMBER]->(m:Entity | Community)
         WHERE e.group_id IN $group_ids
+        """
+            + cursor_query
+            + """
         RETURN
             e.uuid As uuid,
             e.group_id AS group_id,
             n.uuid AS source_node_uuid, 
             m.uuid AS target_node_uuid, 
             e.created_at AS created_at
-        """,
+        ORDER BY e.uuid DESC
+        """
+            + limit_query,
             group_ids=group_ids,
+            created_at=created_at,
+            limit=limit,
             database_=DEFAULT_DATABASE,
+            routing_='r',
         )
 
         edges = [get_community_edge_from_record(record) for record in records]

@@ -1,14 +1,13 @@
 import asyncio
 import logging
 from collections import defaultdict
-from datetime import datetime, timezone
 
 from neo4j import AsyncDriver
 from pydantic import BaseModel
 
 from graphiti_core.edges import CommunityEdge
 from graphiti_core.embedder import EmbedderClient
-from graphiti_core.helpers import DEFAULT_DATABASE
+from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.nodes import (
     CommunityNode,
@@ -16,6 +15,8 @@ from graphiti_core.nodes import (
     get_community_node_from_record,
 )
 from graphiti_core.prompts import prompt_library
+from graphiti_core.prompts.summarize_nodes import Summary, SummaryDescription
+from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.edge_operations import build_community_edges
 
 MAX_COMMUNITY_BUILD_CONCURRENCY = 10
@@ -70,7 +71,7 @@ async def get_community_clusters(
 
         community_clusters.extend(
             list(
-                await asyncio.gather(
+                await semaphore_gather(
                     *[EntityNode.get_by_uuids(driver, cluster) for cluster in cluster_uuids]
                 )
             )
@@ -131,7 +132,7 @@ async def summarize_pair(llm_client: LLMClient, summary_pair: tuple[str, str]) -
     context = {'node_summaries': [{'summary': summary} for summary in summary_pair]}
 
     llm_response = await llm_client.generate_response(
-        prompt_library.summarize_nodes.summarize_pair(context)
+        prompt_library.summarize_nodes.summarize_pair(context), response_model=Summary
     )
 
     pair_summary = llm_response.get('summary', '')
@@ -143,7 +144,8 @@ async def generate_summary_description(llm_client: LLMClient, summary: str) -> s
     context = {'summary': summary}
 
     llm_response = await llm_client.generate_response(
-        prompt_library.summarize_nodes.summary_description(context)
+        prompt_library.summarize_nodes.summary_description(context),
+        response_model=SummaryDescription,
     )
 
     description = llm_response.get('description', '')
@@ -162,7 +164,7 @@ async def build_community(
             odd_one_out = summaries.pop()
             length -= 1
         new_summaries: list[str] = list(
-            await asyncio.gather(
+            await semaphore_gather(
                 *[
                     summarize_pair(llm_client, (str(left_summary), str(right_summary)))
                     for left_summary, right_summary in zip(
@@ -178,7 +180,7 @@ async def build_community(
 
     summary = summaries[0]
     name = await generate_summary_description(llm_client, summary)
-    now = datetime.now(timezone.utc)
+    now = utc_now()
     community_node = CommunityNode(
         name=name,
         group_id=community_cluster[0].group_id,
@@ -205,7 +207,9 @@ async def build_communities(
             return await build_community(llm_client, cluster)
 
     communities: list[tuple[CommunityNode, list[CommunityEdge]]] = list(
-        await asyncio.gather(*[limited_build_community(cluster) for cluster in community_clusters])
+        await semaphore_gather(
+            *[limited_build_community(cluster) for cluster in community_clusters]
+        )
     )
 
     community_nodes: list[CommunityNode] = []
@@ -305,7 +309,7 @@ async def update_community(
     community.name = new_name
 
     if is_new:
-        community_edge = (build_community_edges([entity], community, datetime.now()))[0]
+        community_edge = (build_community_edges([entity], community, utc_now()))[0]
         await community_edge.save(driver)
 
     await community.generate_name_embedding(embedder)
