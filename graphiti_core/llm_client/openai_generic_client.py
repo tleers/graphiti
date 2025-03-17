@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import json
 import logging
 import typing
 from typing import ClassVar
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = 'gpt-4o-mini'
 
 
-class OpenAIClient(LLMClient):
+class OpenAIGenericClient(LLMClient):
     """
     OpenAIClient is a client class for interacting with OpenAI's language models.
 
@@ -58,11 +59,7 @@ class OpenAIClient(LLMClient):
     MAX_RETRIES: ClassVar[int] = 2
 
     def __init__(
-        self,
-        config: LLMConfig | None = None,
-        cache: bool = False,
-        client: typing.Any = None,
-        max_tokens: int = DEFAULT_MAX_TOKENS,
+        self, config: LLMConfig | None = None, cache: bool = False, client: typing.Any = None
     ):
         """
         Initialize the OpenAIClient with the provided configuration, cache setting, and client.
@@ -101,24 +98,15 @@ class OpenAIClient(LLMClient):
             elif m.role == 'system':
                 openai_messages.append({'role': 'system', 'content': m.content})
         try:
-            response = await self.client.beta.chat.completions.parse(
+            response = await self.client.chat.completions.create(
                 model=self.model or DEFAULT_MODEL,
                 messages=openai_messages,
                 temperature=self.temperature,
-                max_tokens=max_tokens or self.max_tokens,
-                response_format=response_model,  # type: ignore
+                max_tokens=self.max_tokens,
+                response_format={'type': 'json_object'},
             )
-
-            response_object = response.choices[0].message
-
-            if response_object.parsed:
-                return response_object.parsed.model_dump()
-            elif response_object.refusal:
-                raise RefusalError(response_object.refusal)
-            else:
-                raise Exception(f'Invalid response from LLM: {response_object.model_dump()}')
-        except openai.LengthFinishReasonError as e:
-            raise Exception(f'Output length exceeded max tokens {self.max_tokens}: {e}') from e
+            result = response.choices[0].message.content or ''
+            return json.loads(result)
         except openai.RateLimitError as e:
             raise RateLimitError from e
         except Exception as e:
@@ -134,9 +122,19 @@ class OpenAIClient(LLMClient):
         retry_count = 0
         last_error = None
 
+        if response_model is not None:
+            serialized_model = json.dumps(response_model.model_json_schema())
+            messages[
+                -1
+            ].content += (
+                f'\n\nRespond with a JSON object in the following format:\n\n{serialized_model}'
+            )
+
         while retry_count <= self.MAX_RETRIES:
             try:
-                response = await self._generate_response(messages, response_model, max_tokens)
+                response = await self._generate_response(
+                    messages, response_model, max_tokens=max_tokens
+                )
                 return response
             except (RateLimitError, RefusalError):
                 # These errors should not trigger retries

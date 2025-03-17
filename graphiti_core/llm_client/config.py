@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
-DEFAULT_MAX_TOKENS = 16384
+DEFAULT_MAX_TOKENS = 2048
 DEFAULT_TEMPERATURE = 0
 DEFAULT_API_VERSION = "2024-02-15-preview"
 

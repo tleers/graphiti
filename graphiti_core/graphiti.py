@@ -14,20 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from time import time
 
 from dotenv import load_dotenv
 from neo4j import AsyncGraphDatabase
 from pydantic import BaseModel
+from typing_extensions import LiteralString
 
 from graphiti_core.cross_encoder.client import CrossEncoderClient
 from graphiti_core.cross_encoder.openai_reranker_client import OpenAIRerankerClient
 from graphiti_core.edges import EntityEdge, EpisodicEdge
 from graphiti_core.embedder import EmbedderClient, OpenAIEmbedder
-from graphiti_core.helpers import DEFAULT_DATABASE
+from graphiti_core.helpers import DEFAULT_DATABASE, semaphore_gather
 from graphiti_core.llm_client import LLMClient, OpenAIClient
 from graphiti_core.nodes import CommunityNode, EntityNode, EpisodeType, EpisodicNode
 from graphiti_core.search.search import SearchConfig, search
@@ -35,19 +35,13 @@ from graphiti_core.search.search_config import DEFAULT_SEARCH_LIMIT, SearchResul
 from graphiti_core.search.search_config_recipes import (
     EDGE_HYBRID_SEARCH_NODE_DISTANCE,
     EDGE_HYBRID_SEARCH_RRF,
-    NODE_HYBRID_SEARCH_NODE_DISTANCE,
-    NODE_HYBRID_SEARCH_RRF,
 )
+from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import (
     RELEVANT_SCHEMA_LIMIT,
-    get_communities_by_nodes,
     get_mentioned_nodes,
     get_relevant_edges,
     get_relevant_nodes,
-)
-from graphiti_core.utils import (
-    build_episodic_edges,
-    retrieve_episodes,
 )
 from graphiti_core.utils.bulk_utils import (
     RawEpisode,
@@ -59,12 +53,14 @@ from graphiti_core.utils.bulk_utils import (
     resolve_edge_pointers,
     retrieve_previous_episodes_bulk,
 )
+from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.community_operations import (
     build_communities,
     remove_communities,
     update_community,
 )
 from graphiti_core.utils.maintenance.edge_operations import (
+    build_episodic_edges,
     dedupe_extracted_edge,
     extract_edges,
     resolve_edge_contradictions,
@@ -73,6 +69,7 @@ from graphiti_core.utils.maintenance.edge_operations import (
 from graphiti_core.utils.maintenance.graph_data_operations import (
     EPISODE_WINDOW_LEN,
     build_indices_and_constraints,
+    retrieve_episodes,
 )
 from graphiti_core.utils.maintenance.node_operations import (
     extract_nodes,
@@ -292,6 +289,7 @@ class Graphiti:
         group_id: str = '',
         uuid: str | None = None,
         update_communities: bool = False,
+        entity_types: dict[str, BaseModel] | None = None,
     ) -> AddEpisodeResults:
         """
         Process an episode and update the graph.
@@ -343,45 +341,62 @@ class Graphiti:
             start = time()
 
             entity_edges: list[EntityEdge] = []
-            now = datetime.now(timezone.utc)
+            now = utc_now()
 
             previous_episodes = await self.retrieve_episodes(
-                reference_time, last_n=3, group_ids=[group_id]
+                reference_time, last_n=RELEVANT_SCHEMA_LIMIT, group_ids=[group_id]
             )
-            episode = EpisodicNode(
-                name=name,
-                group_id=group_id,
-                labels=[],
-                source=source,
-                content=episode_body,
-                source_description=source_description,
-                created_at=now,
-                valid_at=reference_time,
+
+            episode = (
+                await EpisodicNode.get_by_uuid(self.driver, uuid)
+                if uuid is not None
+                else EpisodicNode(
+                    name=name,
+                    group_id=group_id,
+                    labels=[],
+                    source=source,
+                    content=episode_body,
+                    source_description=source_description,
+                    created_at=now,
+                    valid_at=reference_time,
+                )
             )
-            episode.uuid = uuid if uuid is not None else episode.uuid
 
             # Extract entities as nodes
 
-            extracted_nodes = await extract_nodes(self.llm_client, episode, previous_episodes)
+            extracted_nodes = await extract_nodes(
+                self.llm_client, episode, previous_episodes, entity_types
+            )
             logger.debug(f'Extracted nodes: {[(n.name, n.uuid) for n in extracted_nodes]}')
 
             # Calculate Embeddings
 
-            await asyncio.gather(
+            await semaphore_gather(
                 *[node.generate_name_embedding(self.embedder) for node in extracted_nodes]
             )
 
-            # Resolve extracted nodes with nodes already in the graph and extract facts
+            # Find relevant nodes already in the graph
             existing_nodes_lists: list[list[EntityNode]] = list(
-                await asyncio.gather(
-                    *[get_relevant_nodes([node], self.driver) for node in extracted_nodes]
+                await semaphore_gather(
+                    *[
+                        get_relevant_nodes(self.driver, SearchFilters(), [node])
+                        for node in extracted_nodes
+                    ]
                 )
             )
 
+            # Resolve extracted nodes with nodes already in the graph and extract facts
             logger.debug(f'Extracted nodes: {[(n.name, n.uuid) for n in extracted_nodes]}')
 
-            (mentioned_nodes, uuid_map), extracted_edges = await asyncio.gather(
-                resolve_extracted_nodes(self.llm_client, extracted_nodes, existing_nodes_lists),
+            (mentioned_nodes, uuid_map), extracted_edges = await semaphore_gather(
+                resolve_extracted_nodes(
+                    self.llm_client,
+                    extracted_nodes,
+                    existing_nodes_lists,
+                    episode,
+                    previous_episodes,
+                    entity_types,
+                ),
                 extract_edges(
                     self.llm_client, episode, extracted_nodes, previous_episodes, group_id
                 ),
@@ -394,7 +409,7 @@ class Graphiti:
             )
 
             # calculate embeddings
-            await asyncio.gather(
+            await semaphore_gather(
                 *[
                     edge.generate_embedding(self.embedder)
                     for edge in extracted_edges_with_resolved_pointers
@@ -403,7 +418,7 @@ class Graphiti:
 
             # Resolve extracted edges with related edges already in the graph
             related_edges_list: list[list[EntityEdge]] = list(
-                await asyncio.gather(
+                await semaphore_gather(
                     *[
                         get_relevant_edges(
                             self.driver,
@@ -424,7 +439,7 @@ class Graphiti:
             )
 
             existing_source_edges_list: list[list[EntityEdge]] = list(
-                await asyncio.gather(
+                await semaphore_gather(
                     *[
                         get_relevant_edges(
                             self.driver,
@@ -439,7 +454,7 @@ class Graphiti:
             )
 
             existing_target_edges_list: list[list[EntityEdge]] = list(
-                await asyncio.gather(
+                await semaphore_gather(
                     *[
                         get_relevant_edges(
                             self.driver,
@@ -488,7 +503,7 @@ class Graphiti:
 
             # Update any communities
             if update_communities:
-                await asyncio.gather(
+                await semaphore_gather(
                     *[
                         update_community(self.driver, self.llm_client, self.embedder, node)
                         for node in nodes
@@ -502,6 +517,7 @@ class Graphiti:
         except Exception as e:
             raise e
 
+    #### WIP: USE AT YOUR OWN RISK ####
     async def add_episode_bulk(self, bulk_episodes: list[RawEpisode], group_id: str = ''):
         """
         Process multiple episodes in bulk and update the graph.
@@ -541,7 +557,7 @@ class Graphiti:
         """
         try:
             start = time()
-            now = datetime.now(timezone.utc)
+            now = utc_now()
 
             episodes = [
                 EpisodicNode(
@@ -558,7 +574,7 @@ class Graphiti:
             ]
 
             # Save all the episodes
-            await asyncio.gather(*[episode.save(self.driver) for episode in episodes])
+            await semaphore_gather(*[episode.save(self.driver) for episode in episodes])
 
             # Get previous episode context for each episode
             episode_pairs = await retrieve_previous_episodes_bulk(self.driver, episodes)
@@ -571,19 +587,19 @@ class Graphiti:
             ) = await extract_nodes_and_edges_bulk(self.llm_client, episode_pairs)
 
             # Generate embeddings
-            await asyncio.gather(
+            await semaphore_gather(
                 *[node.generate_name_embedding(self.embedder) for node in extracted_nodes],
                 *[edge.generate_embedding(self.embedder) for edge in extracted_edges],
             )
 
             # Dedupe extracted nodes, compress extracted edges
-            (nodes, uuid_map), extracted_edges_timestamped = await asyncio.gather(
+            (nodes, uuid_map), extracted_edges_timestamped = await semaphore_gather(
                 dedupe_nodes_bulk(self.driver, self.llm_client, extracted_nodes),
                 extract_edge_dates_bulk(self.llm_client, extracted_edges, episode_pairs),
             )
 
             # save nodes to KG
-            await asyncio.gather(*[node.save(self.driver) for node in nodes])
+            await semaphore_gather(*[node.save(self.driver) for node in nodes])
 
             # re-map edge pointers so that they don't point to discard dupe nodes
             extracted_edges_with_resolved_pointers: list[EntityEdge] = resolve_edge_pointers(
@@ -594,7 +610,7 @@ class Graphiti:
             )
 
             # save episodic edges to KG
-            await asyncio.gather(
+            await semaphore_gather(
                 *[edge.save(self.driver) for edge in episodic_edges_with_resolved_pointers]
             )
 
@@ -607,7 +623,7 @@ class Graphiti:
             # invalidate edges
 
             # save edges to KG
-            await asyncio.gather(*[edge.save(self.driver) for edge in edges])
+            await semaphore_gather(*[edge.save(self.driver) for edge in edges])
 
             end = time()
             logger.info(f'Completed add_episode_bulk in {(end - start) * 1000} ms')
@@ -630,12 +646,12 @@ class Graphiti:
             self.driver, self.llm_client, group_ids
         )
 
-        await asyncio.gather(
+        await semaphore_gather(
             *[node.generate_name_embedding(self.embedder) for node in community_nodes]
         )
 
-        await asyncio.gather(*[node.save(self.driver) for node in community_nodes])
-        await asyncio.gather(*[edge.save(self.driver) for edge in community_edges])
+        await semaphore_gather(*[node.save(self.driver) for node in community_nodes])
+        await semaphore_gather(*[edge.save(self.driver) for edge in community_edges])
 
         return community_nodes
 
@@ -645,6 +661,7 @@ class Graphiti:
         center_node_uuid: str | None = None,
         group_ids: list[str] | None = None,
         num_results=DEFAULT_SEARCH_LIMIT,
+        search_filter: SearchFilters | None = None,
     ) -> list[EntityEdge]:
         """
         Perform a hybrid search on the knowledge graph.
@@ -690,6 +707,7 @@ class Graphiti:
                 query,
                 group_ids,
                 search_config,
+                search_filter if search_filter is not None else SearchFilters(),
                 center_node_uuid,
             )
         ).edges
@@ -703,6 +721,7 @@ class Graphiti:
         group_ids: list[str] | None = None,
         center_node_uuid: str | None = None,
         bfs_origin_node_uuids: list[str] | None = None,
+        search_filter: SearchFilters | None = None,
     ) -> SearchResults:
         return await search(
             self.driver,
@@ -711,75 +730,15 @@ class Graphiti:
             query,
             group_ids,
             config,
+            search_filter if search_filter is not None else SearchFilters(),
             center_node_uuid,
             bfs_origin_node_uuids,
         )
 
-    async def get_nodes_by_query(
-        self,
-        query: str,
-        center_node_uuid: str | None = None,
-        group_ids: list[str] | None = None,
-        limit: int = DEFAULT_SEARCH_LIMIT,
-    ) -> list[EntityNode]:
-        """
-        Retrieve nodes from the graph database based on a text query.
-
-        This method performs a hybrid search using both text-based and
-        embedding-based approaches to find relevant nodes.
-
-        Parameters
-        ----------
-        query : str
-            The text query to search for in the graph
-        center_node_uuid: str, optional
-            Facts will be reranked based on proximity to this node.
-        group_ids : list[str | None] | None, optional
-            The graph partitions to return data from.
-        limit : int | None, optional
-            The maximum number of results to return per search method.
-            If None, a default limit will be applied.
-
-        Returns
-        -------
-        list[EntityNode]
-            A list of EntityNode objects that match the search criteria.
-
-        Notes
-        -----
-        This method uses the following steps:
-        1. Generates an embedding for the input query using the LLM client's embedder.
-        2. Calls the hybrid_node_search function with both the text query and its embedding.
-        3. The hybrid search combines fulltext search and vector similarity search
-           to find the most relevant nodes.
-
-        The method leverages the LLM client's embedding capabilities to enhance
-        the search with semantic similarity matching. The 'limit' parameter is applied
-        to each individual search method before results are combined and deduplicated.
-        If not specified, a default limit (defined in the search functions) will be used.
-        """
-        search_config = (
-            NODE_HYBRID_SEARCH_RRF if center_node_uuid is None else NODE_HYBRID_SEARCH_NODE_DISTANCE
-        )
-        search_config.limit = limit
-
-        nodes = (
-            await search(
-                self.driver,
-                self.embedder,
-                self.cross_encoder,
-                query,
-                group_ids,
-                search_config,
-                center_node_uuid,
-            )
-        ).nodes
-        return nodes
-
-    async def get_episode_mentions(self, episode_uuids: list[str]) -> SearchResults:
+    async def get_nodes_and_edges_by_episode(self, episode_uuids: list[str]) -> SearchResults:
         episodes = await EpisodicNode.get_by_uuids(self.driver, episode_uuids)
 
-        edges_list = await asyncio.gather(
+        edges_list = await semaphore_gather(
             *[EntityEdge.get_by_uuids(self.driver, episode.entity_edges) for episode in episodes]
         )
 
@@ -787,9 +746,7 @@ class Graphiti:
 
         nodes = await get_mentioned_nodes(self.driver, episodes)
 
-        communities = await get_communities_by_nodes(self.driver, nodes)
-
-        return SearchResults(edges=edges, nodes=nodes, communities=communities)
+        return SearchResults(edges=edges, nodes=nodes, communities=[])
 
     async def add_triplet(self, source_node: EntityNode, edge: EntityEdge, target_node: EntityNode):
         if source_node.name_embedding is None:
@@ -799,23 +756,25 @@ class Graphiti:
         if edge.fact_embedding is None:
             await edge.generate_embedding(self.embedder)
 
-        resolved_nodes, _ = await resolve_extracted_nodes(
+        resolved_nodes, uuid_map = await resolve_extracted_nodes(
             self.llm_client,
             [source_node, target_node],
             [
-                await get_relevant_nodes([source_node], self.driver),
-                await get_relevant_nodes([target_node], self.driver),
+                await get_relevant_nodes(self.driver, SearchFilters(), [source_node]),
+                await get_relevant_nodes(self.driver, SearchFilters(), [target_node]),
             ],
         )
 
+        updated_edge = resolve_edge_pointers([edge], uuid_map)[0]
+
         related_edges = await get_relevant_edges(
             self.driver,
-            [edge],
+            [updated_edge],
             source_node_uuid=resolved_nodes[0].uuid,
             target_node_uuid=resolved_nodes[1].uuid,
         )
 
-        resolved_edge = await dedupe_extracted_edge(self.llm_client, edge, related_edges)
+        resolved_edge = await dedupe_extracted_edge(self.llm_client, updated_edge, related_edges)
 
         contradicting_edges = await get_edge_contradictions(self.llm_client, edge, related_edges)
         invalidated_edges = resolve_edge_contradictions(resolved_edge, contradicting_edges)
@@ -823,3 +782,34 @@ class Graphiti:
         await add_nodes_and_edges_bulk(
             self.driver, [], [], resolved_nodes, [resolved_edge] + invalidated_edges
         )
+
+    async def remove_episode(self, episode_uuid: str):
+        # Find the episode to be deleted
+        episode = await EpisodicNode.get_by_uuid(self.driver, episode_uuid)
+
+        # Find edges mentioned by the episode
+        edges = await EntityEdge.get_by_uuids(self.driver, episode.entity_edges)
+
+        # We should only delete edges created by the episode
+        edges_to_delete: list[EntityEdge] = []
+        for edge in edges:
+            if edge.episodes[0] == episode.uuid:
+                edges_to_delete.append(edge)
+
+        # Find nodes mentioned by the episode
+        nodes = await get_mentioned_nodes(self.driver, [episode])
+        # We should delete all nodes that are only mentioned in the deleted episode
+        nodes_to_delete: list[EntityNode] = []
+        for node in nodes:
+            query: LiteralString = 'MATCH (e:Episodic)-[:MENTIONS]->(n:Entity {uuid: $uuid}) RETURN count(*) AS episode_count'
+            records, _, _ = await self.driver.execute_query(
+                query, uuid=node.uuid, database_=DEFAULT_DATABASE, routing_='r'
+            )
+
+            for record in records:
+                if record['episode_count'] == 1:
+                    nodes_to_delete.append(node)
+
+        await semaphore_gather(*[node.delete(self.driver) for node in nodes_to_delete])
+        await semaphore_gather(*[edge.delete(self.driver) for edge in edges_to_delete])
+        await episode.delete(self.driver)

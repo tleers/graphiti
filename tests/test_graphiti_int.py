@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio
 import logging
 import os
 import sys
@@ -25,10 +24,12 @@ from dotenv import load_dotenv
 
 from graphiti_core.edges import EntityEdge, EpisodicEdge
 from graphiti_core.graphiti import Graphiti
+from graphiti_core.helpers import semaphore_gather
 from graphiti_core.nodes import EntityNode, EpisodicNode
 from graphiti_core.search.search_config_recipes import (
     COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
 )
+from graphiti_core.search.search_filters import SearchFilters
 
 pytestmark = pytest.mark.integration
 
@@ -66,47 +67,14 @@ def setup_logging():
 async def test_graphiti_init():
     logger = setup_logging()
     graphiti = Graphiti(NEO4J_URI, NEO4j_USER, NEO4j_PASSWORD)
-    now = datetime.now(timezone.utc)
-
-    alice_node = EntityNode(
-        name='Alice',
-        labels=[],
-        created_at=now,
-        summary='Alice summary',
-        group_id='test',
-    )
-
-    bob_node = EntityNode(
-        name='Bob',
-        labels=[],
-        created_at=now,
-        summary='Bob summary',
-        group_id='test',
-    )
-
-    entity_edge = EntityEdge(
-        source_node_uuid=alice_node.uuid,
-        target_node_uuid=bob_node.uuid,
-        created_at=now,
-        name='likes',
-        fact='Alice likes Bob',
-        episodes=[],
-        expired_at=now,
-        valid_at=now,
-        group_id='test',
-    )
-
-    await graphiti.add_triplet(alice_node, entity_edge, bob_node)
-
-    episodes = await graphiti.retrieve_episodes(datetime.now(timezone.utc), group_ids=None)
-    episode_uuids = [episode.uuid for episode in episodes]
 
     results = await graphiti._search(
-        "Emily: I can't log in",
+        'My name is Alice',
         COMBINED_HYBRID_SEARCH_CROSS_ENCODER,
-        bfs_origin_node_uuids=episode_uuids,
-        group_ids=None,
+        group_ids=['test'],
+        search_filter=SearchFilters(node_labels=['Entity']),
     )
+
     pretty_results = {
         'edges': [edge.fact for edge in results.edges],
         'nodes': [node.name for node in results.nodes],
@@ -171,8 +139,8 @@ async def test_graph_integration():
     edges = [episodic_edge_1, episodic_edge_2, entity_edge]
 
     # test save
-    await asyncio.gather(*[node.save(driver) for node in nodes])
-    await asyncio.gather(*[edge.save(driver) for edge in edges])
+    await semaphore_gather(*[node.save(driver) for node in nodes])
+    await semaphore_gather(*[edge.save(driver) for edge in edges])
 
     # test get
     assert await EpisodicNode.get_by_uuid(driver, episode.uuid) is not None
@@ -181,5 +149,5 @@ async def test_graph_integration():
     assert await EntityEdge.get_by_uuid(driver, entity_edge.uuid) is not None
 
     # test delete
-    await asyncio.gather(*[node.delete(driver) for node in nodes])
-    await asyncio.gather(*[edge.delete(driver) for edge in edges])
+    await semaphore_gather(*[node.delete(driver) for node in nodes])
+    await semaphore_gather(*[edge.delete(driver) for edge in edges])

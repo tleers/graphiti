@@ -14,18 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-import asyncio
 import logging
 import typing
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime
 from math import ceil
 
 from neo4j import AsyncDriver, AsyncManagedTransaction
 from numpy import dot, sqrt
 from pydantic import BaseModel
+from typing_extensions import Any
 
 from graphiti_core.edges import Edge, EntityEdge, EpisodicEdge
+from graphiti_core.helpers import semaphore_gather
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.models.edges.edge_db_queries import (
     ENTITY_EDGE_SAVE_BULK,
@@ -36,15 +37,19 @@ from graphiti_core.models.nodes.node_db_queries import (
     EPISODIC_NODE_SAVE_BULK,
 )
 from graphiti_core.nodes import EntityNode, EpisodeType, EpisodicNode
+from graphiti_core.search.search_filters import SearchFilters
 from graphiti_core.search.search_utils import get_relevant_edges, get_relevant_nodes
-from graphiti_core.utils import retrieve_episodes
+from graphiti_core.utils.datetime_utils import utc_now
 from graphiti_core.utils.maintenance.edge_operations import (
     build_episodic_edges,
     dedupe_edge_list,
     dedupe_extracted_edges,
     extract_edges,
 )
-from graphiti_core.utils.maintenance.graph_data_operations import EPISODE_WINDOW_LEN
+from graphiti_core.utils.maintenance.graph_data_operations import (
+    EPISODE_WINDOW_LEN,
+    retrieve_episodes,
+)
 from graphiti_core.utils.maintenance.node_operations import (
     dedupe_extracted_nodes,
     dedupe_node_list,
@@ -68,7 +73,7 @@ class RawEpisode(BaseModel):
 async def retrieve_previous_episodes_bulk(
     driver: AsyncDriver, episodes: list[EpisodicNode]
 ) -> list[tuple[EpisodicNode, list[EpisodicNode]]]:
-    previous_episodes_list = await asyncio.gather(
+    previous_episodes_list = await semaphore_gather(
         *[
             retrieve_episodes(
                 driver, episode.valid_at, last_n=EPISODE_WINDOW_LEN, group_ids=[episode.group_id]
@@ -106,8 +111,23 @@ async def add_nodes_and_edges_bulk_tx(
     episodes = [dict(episode) for episode in episodic_nodes]
     for episode in episodes:
         episode['source'] = str(episode['source'].value)
+    nodes: list[dict[str, Any]] = []
+    for node in entity_nodes:
+        entity_data: dict[str, Any] = {
+            'uuid': node.uuid,
+            'name': node.name,
+            'name_embedding': node.name_embedding,
+            'group_id': node.group_id,
+            'summary': node.summary,
+            'created_at': node.created_at,
+        }
+
+        entity_data.update(node.attributes or {})
+        entity_data['labels'] = list(set(node.labels + ['Entity']))
+        nodes.append(entity_data)
+
     await tx.run(EPISODIC_NODE_SAVE_BULK, episodes=episodes)
-    await tx.run(ENTITY_NODE_SAVE_BULK, nodes=[dict(entity) for entity in entity_nodes])
+    await tx.run(ENTITY_NODE_SAVE_BULK, nodes=nodes)
     await tx.run(EPISODIC_EDGE_SAVE_BULK, episodic_edges=[dict(edge) for edge in episodic_edges])
     await tx.run(ENTITY_EDGE_SAVE_BULK, entity_edges=[dict(edge) for edge in entity_edges])
 
@@ -115,7 +135,7 @@ async def add_nodes_and_edges_bulk_tx(
 async def extract_nodes_and_edges_bulk(
     llm_client: LLMClient, episode_tuples: list[tuple[EpisodicNode, list[EpisodicNode]]]
 ) -> tuple[list[EntityNode], list[EntityEdge], list[EpisodicEdge]]:
-    extracted_nodes_bulk = await asyncio.gather(
+    extracted_nodes_bulk = await semaphore_gather(
         *[
             extract_nodes(llm_client, episode, previous_episodes)
             for episode, previous_episodes in episode_tuples
@@ -127,7 +147,7 @@ async def extract_nodes_and_edges_bulk(
         [episode[1] for episode in episode_tuples],
     )
 
-    extracted_edges_bulk = await asyncio.gather(
+    extracted_edges_bulk = await semaphore_gather(
         *[
             extract_edges(
                 llm_client,
@@ -168,13 +188,13 @@ async def dedupe_nodes_bulk(
     node_chunks = [nodes[i : i + CHUNK_SIZE] for i in range(0, len(nodes), CHUNK_SIZE)]
 
     existing_nodes_chunks: list[list[EntityNode]] = list(
-        await asyncio.gather(
-            *[get_relevant_nodes(node_chunk, driver) for node_chunk in node_chunks]
+        await semaphore_gather(
+            *[get_relevant_nodes(driver, SearchFilters(), node_chunk) for node_chunk in node_chunks]
         )
     )
 
     results: list[tuple[list[EntityNode], dict[str, str]]] = list(
-        await asyncio.gather(
+        await semaphore_gather(
             *[
                 dedupe_extracted_nodes(llm_client, node_chunk, existing_nodes_chunks[i])
                 for i, node_chunk in enumerate(node_chunks)
@@ -202,13 +222,13 @@ async def dedupe_edges_bulk(
     ]
 
     relevant_edges_chunks: list[list[EntityEdge]] = list(
-        await asyncio.gather(
+        await semaphore_gather(
             *[get_relevant_edges(driver, edge_chunk, None, None) for edge_chunk in edge_chunks]
         )
     )
 
     resolved_edge_chunks: list[list[EntityEdge]] = list(
-        await asyncio.gather(
+        await semaphore_gather(
             *[
                 dedupe_extracted_edges(llm_client, edge_chunk, relevant_edges_chunks[i])
                 for i, edge_chunk in enumerate(edge_chunks)
@@ -289,7 +309,9 @@ async def compress_nodes(
             # add both nodes to the shortest chunk
             node_chunks[-1].extend([n, m])
 
-    results = await asyncio.gather(*[dedupe_node_list(llm_client, chunk) for chunk in node_chunks])
+    results = await semaphore_gather(
+        *[dedupe_node_list(llm_client, chunk) for chunk in node_chunks]
+    )
 
     extended_map = dict(uuid_map)
     compressed_nodes: list[EntityNode] = []
@@ -312,7 +334,9 @@ async def compress_edges(llm_client: LLMClient, edges: list[EntityEdge]) -> list
     # We build a map of the edges based on their source and target nodes.
     edge_chunks = chunk_edges_by_nodes(edges)
 
-    results = await asyncio.gather(*[dedupe_edge_list(llm_client, chunk) for chunk in edge_chunks])
+    results = await semaphore_gather(
+        *[dedupe_edge_list(llm_client, chunk) for chunk in edge_chunks]
+    )
 
     compressed_edges: list[EntityEdge] = []
     for edge_chunk in results:
@@ -365,7 +389,7 @@ async def extract_edge_dates_bulk(
         episode.uuid: (episode, previous_episodes) for episode, previous_episodes in episode_pairs
     }
 
-    results = await asyncio.gather(
+    results = await semaphore_gather(
         *[
             extract_edge_dates(
                 llm_client,
@@ -385,7 +409,7 @@ async def extract_edge_dates_bulk(
         edge.valid_at = valid_at
         edge.invalid_at = invalid_at
         if edge.invalid_at:
-            edge.expired_at = datetime.now(timezone.utc)
+            edge.expired_at = utc_now()
 
     return edges
 
